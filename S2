@@ -1,0 +1,336 @@
+// Function to mask clouds using the Sentinel-2 QA band.
+function maskS2clouds(image) {
+  var qa = image.select('QA60');
+
+  // Bits 10 and 11 are clouds and cirrus, respectively.
+  var cloudBitMask = 1 << 10;
+  var cirrusBitMask = 1 << 11;
+
+  // Both flags should be set to zero, indicating clear conditions.
+  var mask = qa.bitwiseAnd(cloudBitMask).eq(0)
+      .and(qa.bitwiseAnd(cirrusBitMask).eq(0));
+
+  return image.updateMask(mask).divide(10000);
+}
+
+// Load images
+var before = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+                  .filterDate('2023-09-01', '2023-12-15')
+                  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
+                  .map(maskS2clouds)
+                  .filterBounds(geometry);
+
+var current = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+                  .filterDate('2023-12-30', '2024-02-28')
+                  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
+                  .map(maskS2clouds)
+                  .filterBounds(geometry);
+                  
+var after = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+                  .filterDate(ee.Date('2024-06-01'), ee.Date('2024-08-30'))
+                  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 10))
+                  .map(maskS2clouds)
+                  .filterBounds(geometry)
+                  .select('B.*');
+                  
+var after2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+                  .filterDate(ee.Date('2024-10-01'), ee.Date('2024-10-30'))
+                  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 10))
+                  .map(maskS2clouds)
+                  .filterBounds(geometry)
+                  .select('B.*');
+                  
+var current2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+                  .filterDate('2024-03-27', '2024-03-28')
+                  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
+                  .map(maskS2clouds)
+                  .filterBounds(geometry);
+                  
+print(after2);
+
+var afterMedian = after.median().clip(geometry)
+var after2Median = after2.median().clip(geometry)
+var beforeMedian = before.median().clip(geometry)
+
+// RGB visualization parameter.
+var rgbVisParams = {
+  min: 0.0,
+  max: 0.3,
+  bands: ['B4', 'B3', 'B2'],  
+  gamma: 1.4
+};
+
+// False-color visualization parameter.
+var falseColorVisParams = {
+  min: 0.0,
+  max: 0.2,  
+  bands: ['B8', 'B4', 'B3'],  
+  gamma: 1.2  
+};
+
+// Display RGB composite
+Map.addLayer(beforeMedian, rgbVisParams, 'RGB Before Eruption',false);
+Map.addLayer(current.median().clip(geometry), rgbVisParams, 'RGB During Eruption',false);
+Map.addLayer(afterMedian, rgbVisParams, 'RGB After Eruption',false);
+Map.addLayer(after2Median, rgbVisParams, 'RGB After2 Eruption',false);
+
+
+Map.addLayer(current2.first().clip(geometry), rgbVisParams, 'RGB current2 Eruption',false);
+Map.addLayer(current2.first().clip(geometry), {
+  min: 0.0,
+  max: 1.5,  
+  bands: ['B12', 'B11', 'B4'],  
+  gamma: 1.2  
+}, 'SWIR- SWIR - Red',false);
+
+// Display False-color composite
+Map.addLayer(beforeMedian, falseColorVisParams, 'False Color Before Eruption',false);
+Map.addLayer(current.mean().clip(geometry), falseColorVisParams, 'False Color During Eruption',false);
+Map.addLayer(afterMedian, falseColorVisParams, 'False Color After Eruption',false);
+
+
+var after2_4 = after2Median.select('B8','B4','B3','B2');
+var after_4 = afterMedian.select('B8','B4','B3','B2');
+var before_4 = beforeMedian.select('B8','B4','B3','B2');
+
+
+// --------------------------------------------------------------------------PC
+var bandNames = ee.List([
+  'B2',   // Blue
+  'B3',   // Green
+  'B4',   // Red
+  'B8'    // NIR
+]);
+
+
+var getPrincipalComponents = function(centered, scale, region) {
+  // Collapse the bands of the image into a 1D array per pixel.
+  var arrays = centered.toArray();
+
+  // Compute the covariance of the bands within the region.
+  var covar = arrays.reduceRegion({
+    reducer: ee.Reducer.centeredCovariance(),
+    geometry: region,
+    scale: scale,
+    maxPixels: 1e9
+  });
+
+  // Get the 'array' covariance result and cast to an array.
+  // This represents the band-to-band covariance within the region.
+  var covarArray = ee.Array(covar.get('array'));
+
+  // Perform an eigen analysis and slice apart the values and vectors.
+  var eigens = covarArray.eigen();
+
+  // This is a P-length vector of Eigenvalues.
+  var eigenValues = eigens.slice(1, 0, 1);
+  // This is a PxP matrix with eigenvectors in rows.
+  var eigenVectors = eigens.slice(1, 1);
+
+  // Convert the array image to 2D arrays for matrix computations.
+  var arrayImage = arrays.toArray(1);
+
+  // Left multiply the image array by the matrix of eigenvectors.
+  var principalComponents = ee.Image(eigenVectors).matrixMultiply(arrayImage);
+  
+  var getNewBandNames = function(name) {
+    var count = bandNames.length();               
+    var seq = ee.List.sequence(1, count);         
+
+    var newBandNames = seq.map(function(b) {      
+        var bandNumber = ee.Number(b).int();          
+        var bandName = ee.String(name).cat(bandNumber); 
+        return bandName;                          
+    });
+
+    return newBandNames;                         
+  };
+
+
+
+
+
+
+  // Turn the square roots of the Eigenvalues into a P-band image.
+  var sdImage = ee.Image(eigenValues.sqrt())
+      .arrayProject([0]).arrayFlatten([getNewBandNames('sd')]);
+
+  // Turn the PCs into a P-band image, normalized by SD.
+  return principalComponents
+      // Throw out an an unneeded dimension, [[]] -> [].
+      .arrayProject([0])
+      // Make the one band array image a multi-band image, [] -> image.
+      .arrayFlatten([getNewBandNames('pc')])
+      // Normalize the PCs by their SDs.
+      .divide(sdImage);
+};
+
+var pcImageAfter = getPrincipalComponents(after_4, 10, geometry);
+var pcImageAfter2 = getPrincipalComponents(after2_4, 10, geometry);
+var pcImageBefore = getPrincipalComponents(before_4, 10, geometry)
+Map.addLayer(pcImageAfter2, {min: -2, max: 2}, 'PC After',false);
+
+
+
+
+
+//-----------------------------------------------Indizes:
+//Mineral Composite
+var after_clipped = after.median().clip(geometry);
+var calculateMineralComposite = function(image){
+    var swir1 = image.select('B11'); // SWIR1
+    var swir2 = image.select('B12'); // SWIR2
+    var nir = image.select('B8');   // NIR
+    var red = image.select('B4');   // Red
+    var blue = image.select('B2');  // Blue
+    
+    var swir1_swir2 = swir1.divide(swir2);  
+    var swir1_nir = swir1.divide(nir);      
+    var red_blue = red.divide(blue);      
+    
+    
+    var mineralComposite = swir1_swir2
+        .addBands(swir1_nir)
+        .addBands(red_blue)
+        .rename(['SWIR1_SWIR2', 'SWIR1_NIR', 'Red_Blue']);
+    
+    return mineralComposite
+}
+
+Map.addLayer(calculateMineralComposite(after_clipped), {min: 0.5, max: 2}, 'Mineral_Composite',false);
+
+
+// --------------------------------------------------Classify
+var classificationCompositeAfter = afterMedian.addBands(pcImageAfter).addBands(calculateMineralComposite(afterMedian))
+var classificationCompositeAfter2 = after2Median.addBands(pcImageAfter2).addBands(calculateMineralComposite(after2Median))
+var classificationCompositeBefore = beforeMedian.addBands(pcImageBefore).addBands(calculateMineralComposite(beforeMedian))
+
+print("Classification Composite Bands:", classificationCompositeAfter.bandNames());
+
+
+var controlPointsAfter = lava.merge(no_lava);
+var classProperty = 'landcover';
+
+print(controlPointsAfter);
+
+
+var trainModel = function(classificationComposite, controlPoints, classProperty) {
+    var training = classificationComposite.sampleRegions({
+        collection: controlPoints,
+        properties: [classProperty],
+        scale: 10
+    });
+
+    var sample = training.randomColumn('random');
+    var split = 0.1;
+    var trainingPartition = sample.filter(ee.Filter.lt('random', split));
+    print('Training size:', trainingPartition.size());
+    var testingPartition = sample.filter(ee.Filter.gte('random', split));
+    print('Val size:', testingPartition.size())
+
+    var classifier = ee.Classifier.smileRandomForest(100).train({
+        features: trainingPartition,
+        classProperty: classProperty,
+        inputProperties: classificationCompositeAfter2.bandNames()
+    });
+    
+    var testClassification = testingPartition.classify(classifier);
+
+    // Compute confusion matrix
+    var confusionMatrix = testClassification.errorMatrix(classProperty, 'classification');
+
+    // Print validation metrics
+    print('Confusion Matrix:', confusionMatrix);
+    print('Overall Accuracy:', confusionMatrix.accuracy());
+    print('Kappa Coefficient:', confusionMatrix.kappa());
+    
+    return classifier;
+};
+
+var classifyImage = function(classificationComposite, classifier) {
+    return classificationComposite.classify(classifier);
+};
+
+var classifier = trainModel(classificationCompositeAfter, controlPointsAfter, 'landcover');
+
+var classified_After_allBands = classifyImage(classificationCompositeAfter, classifier);
+var classified_After2_allBands = classifyImage(classificationCompositeAfter2, classifier);
+var classified_Before_allBands = classifyImage(classificationCompositeBefore, classifier);
+
+
+Map.addLayer(classified_After_allBands, {min: 0, max: 3, palette: ['orange', 'red', 'green', 'blue']}, 'Classified after', false);
+Map.addLayer(classified_After2_allBands, {min: 0, max: 3, palette: ['orange', 'red', 'green', 'blue']}, 'Classified after 2', false);
+Map.addLayer(classified_Before_allBands, {min: 0, max: 3, palette: ['orange', 'red', 'green', 'blue']}, 'Classified before', false);
+
+
+var classificationDifference = classified_After2_allBands.subtract(classified_Before_allBands);
+
+var diffVisParams = {
+    min: -3, 
+    max: 3, 
+    palette: ['white', 'black', 'orange'] 
+};
+
+Map.addLayer(classificationDifference, diffVisParams, 'Class Diff', false);
+
+Export.image.toDrive({
+  image: classificationCompositeAfter2.toFloat(),
+  description: 'classificationCompositeAfter2',
+  scale: 10,  // Adjust based on your dataset resolution
+  region: geometry, // Define the region to export
+  fileFormat: 'GeoTIFF',
+  maxPixels: 1e13
+});
+
+Export.image.toDrive({
+  image: classificationCompositeBefore.toFloat(),
+  description: 'classificationCompositeBefore',
+  scale: 10,  // Adjust based on your dataset resolution
+  region: geometry, // Define the region to export
+  fileFormat: 'GeoTIFF',
+  maxPixels: 1e13
+});
+
+Export.image.toDrive({
+  image: classified_After2_allBands,
+  description: 'classified_After2_allBands',
+  scale: 10,  // Adjust based on your dataset resolution
+  region: geometry, // Define the region to export
+  fileFormat: 'GeoTIFF',
+  maxPixels: 1e13
+});
+
+Export.image.toDrive({
+  image: classified_Before_allBands,
+  description: 'classified_After2_allBands',
+  scale: 10,  // Adjust based on your dataset resolution
+  region: geometry, // Define the region to export
+  fileFormat: 'GeoTIFF',
+  maxPixels: 1e13
+});
+
+Export.image.toDrive({
+  image: classificationDifference.toFloat(),
+  description: 'classificationDifference',
+  scale: 10,  // Adjust based on your dataset resolution
+  region: geometry, // Define the region to export
+  fileFormat: 'GeoTIFF',
+  maxPixels: 1e13
+});
+
+var diagonalSobel135 = ee.Kernel.fixed(3, 3, [
+  [ 2,  1,  0],
+  [ 1,  0, -1],
+  [ 0, -1, -2]
+]);
+print(diagonalSobel135)
+
+
+
+// Apply the diagonal Sobel filter
+var edges135 = classificationCompositeBefore.convolve(diagonalSobel135);
+
+
+
+Map.addLayer(edges135, {}, 'Sobel');
+
